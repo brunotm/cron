@@ -14,6 +14,7 @@ type Cron struct {
 	entries  []*Entry
 	stop     chan struct{}
 	add      chan *Entry
+	delete   chan string
 	snapshot chan []*Entry
 	running  bool
 	ErrorLog Logger
@@ -52,6 +53,9 @@ type Entry struct {
 
 	// The Job to run.
 	Job Job
+
+	// The Job unique name
+	Name string
 }
 
 // byTime is a wrapper for sorting the entry array by time
@@ -83,6 +87,7 @@ func NewWithLocation(location *time.Location) *Cron {
 	return &Cron{
 		entries:  nil,
 		add:      make(chan *Entry),
+		delete:   make(chan string),
 		stop:     make(chan struct{}),
 		snapshot: make(chan []*Entry),
 		running:  false,
@@ -97,25 +102,32 @@ type FuncJob func()
 func (f FuncJob) Run() { f() }
 
 // AddFunc adds a func to the Cron to be run on the given schedule.
-func (c *Cron) AddFunc(spec string, cmd func()) error {
-	return c.AddJob(spec, FuncJob(cmd))
+func (c *Cron) AddFunc(name, spec string, cmd func()) error {
+	return c.AddJob(name, spec, FuncJob(cmd))
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) AddJob(spec string, cmd Job) error {
+// It's the caller responsibility to ensure job names are unique.
+func (c *Cron) AddJob(name, spec string, cmd Job) error {
 	schedule, err := Parse(spec)
 	if err != nil {
 		return err
 	}
-	c.Schedule(schedule, cmd)
+	c.Schedule(name, schedule, cmd)
 	return nil
 }
 
+// DeleteJob deletes the job with the given name.
+func (c *Cron) DeleteJob(name string) {
+	c.delete <- name
+}
+
 // Schedule adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) {
+func (c *Cron) Schedule(name string, schedule Schedule, cmd Job) {
 	entry := &Entry{
 		Schedule: schedule,
 		Job:      cmd,
+		Name:     name,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -211,6 +223,19 @@ func (c *Cron) run() {
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
 				c.entries = append(c.entries, newEntry)
+
+			case name := <-c.delete:
+				timer.Stop()
+				now = c.now()
+
+				x := 0
+				for _, entry := range c.entries {
+					if entry.Name != name {
+						c.entries[x] = entry
+						x++
+					}
+				}
+				c.entries = c.entries[:x]
 
 			case <-c.snapshot:
 				c.snapshot <- c.entrySnapshot()
