@@ -1,9 +1,11 @@
 package cron
 
 import (
+	"context"
 	"log"
 	"runtime"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,6 +13,7 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
+	ctx      context.Context
 	entries  []*Entry
 	stop     chan struct{}
 	add      chan *Entry
@@ -21,9 +24,29 @@ type Cron struct {
 	location *time.Location
 }
 
+// Config is the job configuration parameters
+type Config struct {
+	// Name of Job
+	Name string
+
+	// Spec is the cron scheduling spec
+	Spec string
+
+	// Number of concurrent instances allowed to run
+	Concurrent int64
+
+	// Timeout is the maximum allowed runtime
+	Timeout time.Duration
+}
+
+// A wrapper that turns a func() into a cron.Job
+type FuncJob func(ctx context.Context)
+
+func (f FuncJob) Run(ctx context.Context) { f(ctx) }
+
 // Job is an interface for submitted cron jobs.
 type Job interface {
-	Run()
+	Run(ctx context.Context)
 }
 
 // The Schedule describes a job's duty cycle.
@@ -54,8 +77,11 @@ type Entry struct {
 	// The Job to run.
 	Job Job
 
-	// The Job unique name
-	Name string
+	// Config for Job
+	Config Config
+
+	// active running tasks
+	activeCount int64
 }
 
 // byTime is a wrapper for sorting the entry array by time
@@ -85,6 +111,7 @@ func New() *Cron {
 // NewWithLocation returns a new Cron job runner.
 func NewWithLocation(location *time.Location) *Cron {
 	return &Cron{
+		ctx:      context.Background(),
 		entries:  nil,
 		add:      make(chan *Entry),
 		delete:   make(chan string),
@@ -96,24 +123,19 @@ func NewWithLocation(location *time.Location) *Cron {
 	}
 }
 
-// A wrapper that turns a func() into a cron.Job
-type FuncJob func()
-
-func (f FuncJob) Run() { f() }
-
 // AddFunc adds a func to the Cron to be run on the given schedule.
-func (c *Cron) AddFunc(name, spec string, cmd func()) error {
-	return c.AddJob(name, spec, FuncJob(cmd))
+func (c *Cron) AddFunc(config Config, cmd func(ctx context.Context)) error {
+	return c.AddJob(config, FuncJob(cmd))
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
 // It's the caller responsibility to ensure job names are unique.
-func (c *Cron) AddJob(name, spec string, cmd Job) error {
-	schedule, err := Parse(spec)
+func (c *Cron) AddJob(config Config, cmd Job) error {
+	schedule, err := Parse(config.Spec)
 	if err != nil {
 		return err
 	}
-	c.Schedule(name, schedule, cmd)
+	c.Schedule(config, schedule, cmd)
 	return nil
 }
 
@@ -123,11 +145,16 @@ func (c *Cron) DeleteJob(name string) {
 }
 
 // Schedule adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) Schedule(name string, schedule Schedule, cmd Job) {
+// It ignores any provided spec in the Job config.
+func (c *Cron) Schedule(config Config, schedule Schedule, cmd Job) {
+	if config.Concurrent < 1 {
+		config.Concurrent = 1
+	}
+
 	entry := &Entry{
 		Schedule: schedule,
 		Job:      cmd,
-		Name:     name,
+		Config:   config,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -170,7 +197,7 @@ func (c *Cron) Run() {
 	c.run()
 }
 
-func (c *Cron) runWithRecovery(j Job) {
+func (c *Cron) runWithRecovery(e *Entry) {
 	defer func() {
 		if r := recover(); r != nil {
 			const size = 64 << 10
@@ -179,7 +206,23 @@ func (c *Cron) runWithRecovery(j Job) {
 			c.logf("cron: panic running job: %v\n%s", r, buf)
 		}
 	}()
-	j.Run()
+
+	if atomic.LoadInt64(&e.activeCount) == e.Config.Concurrent {
+		c.logf("cron: maximum number of instances for %s reached", e.Config.Name)
+		return
+	}
+
+	atomic.AddInt64(&e.activeCount, 1)
+	defer atomic.AddInt64(&e.activeCount, -1)
+
+	ctx := c.ctx
+	if e.Config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(c.ctx, e.Config.Timeout)
+		defer cancel()
+	}
+
+	e.Job.Run(ctx)
 }
 
 // Run the scheduler. this is private just due to the need to synchronize
@@ -213,7 +256,7 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					go c.runWithRecovery(e.Job)
+					go c.runWithRecovery(e)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
 				}
@@ -230,7 +273,7 @@ func (c *Cron) run() {
 
 				x := 0
 				for _, entry := range c.entries {
-					if entry.Name != name {
+					if entry.Config.Name != name {
 						c.entries[x] = entry
 						x++
 					}
