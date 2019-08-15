@@ -5,7 +5,6 @@ import (
 	"log"
 	"runtime"
 	"sort"
-	"sync/atomic"
 	"time"
 )
 
@@ -24,31 +23,6 @@ type Cron struct {
 	location *time.Location
 }
 
-// Config is the job configuration parameters
-type Config struct {
-	// Name of Job
-	Name string
-
-	// Spec is the cron scheduling spec
-	Spec string
-
-	// Number of concurrent instances allowed to run
-	Concurrent int64
-
-	// Timeout is the maximum allowed runtime
-	Timeout time.Duration
-}
-
-// A wrapper that turns a func() into a cron.Job
-type FuncJob func(ctx context.Context)
-
-func (f FuncJob) Run(ctx context.Context) { f(ctx) }
-
-// Job is an interface for submitted cron jobs.
-type Job interface {
-	Run(ctx context.Context)
-}
-
 // The Schedule describes a job's duty cycle.
 type Schedule interface {
 	// Return the next activation time, later than the given time.
@@ -59,48 +33,6 @@ type Schedule interface {
 // Logger is a Logger interface.
 type Logger interface {
 	Printf(format string, v ...interface{})
-}
-
-// Entry consists of a schedule and the func to execute on that schedule.
-type Entry struct {
-	// The schedule on which this job should be run.
-	Schedule Schedule
-
-	// The next time the job will run. This is the zero time if Cron has not been
-	// started or this entry's schedule is unsatisfiable
-	Next time.Time
-
-	// The last time this job was run. This is the zero time if the job has never
-	// been run.
-	Prev time.Time
-
-	// The Job to run.
-	Job Job
-
-	// Config for Job
-	Config Config
-
-	// active running tasks
-	activeCount int64
-}
-
-// byTime is a wrapper for sorting the entry array by time
-// (with zero time at the end).
-type byTime []*Entry
-
-func (s byTime) Len() int      { return len(s) }
-func (s byTime) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s byTime) Less(i, j int) bool {
-	// Two zero times should return false.
-	// Otherwise, zero is "greater" than any other time.
-	// (To sort it at the end of the list.)
-	if s[i].Next.IsZero() {
-		return false
-	}
-	if s[j].Next.IsZero() {
-		return true
-	}
-	return s[i].Next.Before(s[j].Next)
 }
 
 // New returns a new Cron job runner, in the Local time zone.
@@ -207,13 +139,13 @@ func (c *Cron) runWithRecovery(e *Entry) {
 		}
 	}()
 
-	if atomic.LoadInt64(&e.activeCount) == e.Config.Concurrent {
+	if e.running() == e.Config.Concurrent {
 		c.logf("cron: maximum number of instances for %s reached", e.Config.Name)
 		return
 	}
 
-	atomic.AddInt64(&e.activeCount, 1)
-	defer atomic.AddInt64(&e.activeCount, -1)
+	e.addRun()
+	defer e.removeRun()
 
 	ctx := c.ctx
 	if e.Config.Timeout > 0 {
