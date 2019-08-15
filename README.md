@@ -4,4 +4,4 @@
 # cron
 
 This is a fork of https://github.com/robfig/cron with a slightly different API
-which supports named Jobs, online Job add/deletion, timeouts and concurrency execution settings.
+which supports named Jobs, online Job add/deletion, timeouts and concurrent execution settings.
