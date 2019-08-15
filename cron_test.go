@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -116,11 +117,12 @@ func TestAddWhileRunningWithDelay(t *testing.T) {
 	cron.Start()
 	defer cron.Stop()
 	time.Sleep(5 * time.Second)
-	var calls = 0
-	cron.AddFunc(Config{Name: "YOLO", Spec: "* * * * * *"}, func(ctx context.Context) { calls += 1 })
+
+	var calls int32
+	cron.AddFunc(Config{Name: "YOLO", Spec: "* * * * * *"}, func(ctx context.Context) { atomic.AddInt32(&calls,1) })
 
 	<-time.After(OneSecond)
-	if calls != 1 {
+	if atomic.LoadInt32(&calls) != 1 {
 		t.Errorf("called %d times, expected 1\n", calls)
 	}
 }
@@ -385,13 +387,14 @@ func (*ZeroSchedule) Next(time.Time) time.Time {
 // Tests that job without time does not run
 func TestJobWithZeroTimeDoesNotRun(t *testing.T) {
 	cron := New()
-	calls := 0
-	cron.AddFunc(Config{Name: "YOLO0", Spec: "* * * * * *"}, func(ctx context.Context) { calls += 1 })
+	var calls int32
+	cron.AddFunc(Config{Name: "YOLO0", Spec: "* * * * * *"}, func(ctx context.Context) { atomic.AddInt32(&calls,1) })
 	cron.Schedule(Config{Name: "YOLO1"}, new(ZeroSchedule), FuncJob(func(ctx context.Context) { t.Error("expected zero task will not run") }))
 	cron.Start()
 	defer cron.Stop()
+
 	<-time.After(OneSecond)
-	if calls != 1 {
+	if atomic.LoadInt32(&calls) != 1 {
 		t.Errorf("called %d times, expected 1\n", calls)
 	}
 }
